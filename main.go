@@ -349,7 +349,7 @@ Options:
 	var nerrors = 0
 	var size string
 
-	lengths := make(map[string]int)
+	all_lengths := make(map[string][]int)
 
 outer:
 	for {
@@ -366,9 +366,10 @@ outer:
 			}
 
 			target := res.target.String()
+			host := res.target.Hostname()
 
 			if res.path == "" {
-				lengths[target] = res.length
+				all_lengths[host] = []int{res.length}
 				continue outer
 			}
 
@@ -378,12 +379,17 @@ outer:
 
 			for _, code := range codes {
 				if code == res.status {
-					length, _ := lengths[target]
-					diff := math.Abs(float64(length-res.length)) * 2 / float64(length+res.length)
+					lengths, _ := all_lengths[host]
 
-					if diff < mindiff {
-						continue outer
+					for _, length := range lengths {
+						diff := math.Abs(float64(length-res.length)) * 2 / float64(length+res.length)
+
+						if diff < mindiff {
+							continue outer
+						}
 					}
+
+					all_lengths[host] = append(lengths, res.length)
 
 					if res.length > 1000 {
 						size = fmt.Sprintf("%.1fKB", float64(res.length)/1000)
