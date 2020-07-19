@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -36,7 +37,6 @@ type Job struct {
 }
 
 type Result struct {
-	done   bool
 	length int
 	method string
 	path   string
@@ -45,6 +45,14 @@ type Result struct {
 }
 
 func main() {
+	path, err := os.Executable()
+
+	if err != nil {
+		panic(err)
+	}
+
+	dir := filepath.Dir(path)
+
 	var headers string
 	var help bool
 	var httpmethods string
@@ -62,7 +70,7 @@ func main() {
 	flag.BoolVar(&help, "h", false, "show usage information and exit")
 	flag.BoolVar(&insecure, "k", false, "allow insecure TLS connections")
 	flag.IntVar(&nroutines, "n", 40, "number of goroutines to run (default: 40)")
-	flag.StringVar(&statuscodes, "s", "200", "comma-separated whitelist of status codes (default: \"200\")")
+	flag.StringVar(&statuscodes, "s", "200", "comma-separated list of acceptable status codes (default: \"200\")")
 	flag.StringVar(&wordlist, "w", "", "wordlist of paths to try (required)")
 
 	flag.Parse()
@@ -72,13 +80,13 @@ func main() {
 
 Options:
   -H     <headers/@file>  comma-separated list/file with request headers
-  -X     <method>         comma-separated list of request methods to send (default: "GET")
+  -X     <methods>        comma-separated list of request methods to send (default: "GET")
   -d     <float>          minimum fractional difference in response payload length per host (default: 0.2)
   -e     <int>            print errors and exit after this many
   -h                      show usage information and exit
   -k                      allow insecure TLS connections
   -n     <int>            number of goroutines to run (default: 40)
-  -s     <codes>          comma-separated whitelist of status codes (default: "200")
+  -s     <codes>          comma-separated list of acceptable status codes (default: "200")
   -w     <file>           wordlist of paths to try (required)`)
 
 		os.Exit(0)
@@ -213,11 +221,20 @@ Options:
 
 	npaths := len(paths)
 	nmethods := len(methods)
+	nrequests := ntargets*npaths*nmethods + ntargets*nmethods
+	banner, err := ioutil.ReadFile(filepath.Join(dir, "banner"))
+
+	if err != nil {
+		panic(err)
+	}
+
+	fmt.Fprintln(os.Stderr, string(banner))
 
 	fmt.Fprintf(os.Stderr, "[-] Identified %d targets\n", ntargets)
 	fmt.Fprintf(os.Stderr, "[-] Loaded %d paths\n", npaths)
+	fmt.Fprintf(os.Stderr, "[-] Total requests: %d\n", nrequests)
 	fmt.Fprintln(os.Stderr, "[-] Request methods:", strings.Join(methods, ","))
-	fmt.Fprintf(os.Stderr, "[-] Sending %d requests\n", ntargets*npaths*nmethods+ntargets*nmethods)
+	fmt.Fprintln(os.Stderr, "[-] Status codes:", statuscodes)
 
 	headermap := make(map[string]string)
 
@@ -236,7 +253,7 @@ Options:
 	fmt.Fprintln(os.Stderr, "[-] Number of goroutines:", nroutines)
 	fmt.Fprintln(os.Stderr, "[-] Minimum diff:", mindiff)
 
-	client := &http.Client{Timeout: 5 * time.Second}
+	client := &http.Client{Timeout: 3 * time.Second}
 	jobs := make(chan *Job)
 	errs := make(chan error)
 	results := make(chan *Result)
@@ -257,7 +274,6 @@ Options:
 		go func() {
 			for job := range jobs {
 				if job.done {
-					results <- &Result{done: true}
 					return
 				}
 
@@ -334,8 +350,6 @@ Options:
 			}
 
 			wg.Wait()
-
-			fmt.Fprintf(os.Stderr, "[-] Finished %s test requests\n", method)
 		}
 
 		for i := 0; i < nroutines; i++ {
@@ -345,38 +359,27 @@ Options:
 		close(jobs)
 	}()
 
-	var done = 0
 	var nerrors = 0
 	var size string
 
 	all_lengths := make(map[string][]int)
 
-outer:
-	for {
+	for i := 0; i < nrequests; i++ {
 		select {
 		case res := <-results:
-			if res.done {
-				done++
-
-				if done == nroutines {
-					break outer
-				}
-
-				continue outer
-			}
-
 			target := res.target.String()
 			host := res.target.Hostname()
 
 			if res.path == "" {
 				all_lengths[host] = []int{res.length}
-				continue outer
+				break
 			}
 
 			if res.length == 0 {
-				continue outer
+				break
 			}
 
+		loop:
 			for _, code := range codes {
 				if code == res.status {
 					lengths, _ := all_lengths[host]
@@ -385,27 +388,29 @@ outer:
 						diff := math.Abs(float64(length-res.length)) * 2 / float64(length+res.length)
 
 						if diff < mindiff {
-							continue outer
+							break loop
 						}
 					}
 
 					all_lengths[host] = append(lengths, res.length)
 
-					if res.length > 1000 {
-						size = fmt.Sprintf("%.1fKB", float64(res.length)/1000)
+					if res.length > 1000000 {
+						size = fmt.Sprintf("%.2fMB", float64(res.length)/1000000)
+					} else if res.length > 1000 {
+						size = fmt.Sprintf("%.2fKB", float64(res.length)/1000)
 					} else {
 						size = fmt.Sprintf("%dB", res.length)
 					}
 
-					fmt.Printf("%s %s - %d (%s)\n", res.method, target+res.path, res.status, size)
+					fmt.Printf("%d - %s %s (%s)\n", res.status, res.method, target+res.path, size)
 
-					continue outer
+					break loop
 				}
 			}
 
 		case err := <-errs:
 			if maxerrors == 0 {
-				continue outer
+				break
 			}
 
 			fmt.Fprintf(os.Stderr, "[!] %v\n", err)
